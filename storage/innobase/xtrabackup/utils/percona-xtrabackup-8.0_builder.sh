@@ -71,20 +71,23 @@ find_artifact() {
     FOUND_FILE=""
     FOUND_PATH=""
 
-    local candidate
-    candidate="$(find "${WORKDIR}/${subdir}" -name "${pattern}" 2>/dev/null | sort | tail -n1)"
-    if [[ -n "$candidate" ]]; then
-        FOUND_FILE="$(basename "$candidate")"
-        FOUND_PATH="$candidate"
-        return 0
-    fi
+    # Search order: WORKDIR/subdir, CURDIR/subdir, WORKDIR root, CURDIR root
+    local search_dirs=(
+        "${WORKDIR}/${subdir}"
+        "${CURDIR}/${subdir}"
+        "${WORKDIR}"
+        "${CURDIR}"
+    )
 
-    candidate="$(find "${CURDIR}/${subdir}" -name "${pattern}" 2>/dev/null | sort | tail -n1)"
-    if [[ -n "$candidate" ]]; then
-        FOUND_FILE="$(basename "$candidate")"
-        FOUND_PATH="$candidate"
-        return 0
-    fi
+    local candidate
+    for dir in "${search_dirs[@]}"; do
+        candidate="$(find "$dir" -maxdepth 1 -name "${pattern}" 2>/dev/null | sort | tail -n1)"
+        if [[ -n "$candidate" ]]; then
+            FOUND_FILE="$(basename "$candidate")"
+            FOUND_PATH="$candidate"
+            return 0
+        fi
+    done
 
     return 1
 }
@@ -270,7 +273,13 @@ _install_deps_rpm() {
         return
     fi
 
-    yum -y install git wget yum-utils curl
+    # Amazon Linux 2023 Docker images ship curl-minimal which conflicts with curl.
+    # Replace it with the full curl package before installing other deps.
+    if [[ "${RHEL}" == "2023" ]]; then
+        yum -y install --allowerasing git wget yum-utils curl
+    else
+        yum -y install git wget yum-utils curl
+    fi
     yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm || true
 
     _configure_rpm_repos
@@ -323,27 +332,32 @@ _configure_rpm_repos() {
 }
 
 _install_rpm_devtoolset() {
-    [[ "${RHEL}" != "8" ]] && return
+    local DT12_PKGS="gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ gcc-toolset-12-binutils"
+    DT12_PKGS+=" gcc-toolset-12-annobin-annocheck gcc-toolset-12-annobin-plugin-gcc"
 
-    if [[ "${ARCH}" == "x86_64" ]]; then
-        local DT10_PKGS="gcc-toolset-10-gcc-c++ gcc-toolset-10-binutils"
-        DT10_PKGS+=" gcc-toolset-10-valgrind gcc-toolset-10-valgrind-devel gcc-toolset-10-libatomic-devel"
-        DT10_PKGS+=" gcc-toolset-10-libasan-devel gcc-toolset-10-libubsan-devel gcc-toolset-10-annobin"
+    case "${RHEL}" in
+        8)
+            if [[ "${ARCH}" == "x86_64" ]]; then
+                # EL8 x86_64: also install devtoolset-10 (used for valgrind/asan)
+                local DT10_PKGS="gcc-toolset-10-gcc-c++ gcc-toolset-10-binutils"
+                DT10_PKGS+=" gcc-toolset-10-valgrind gcc-toolset-10-valgrind-devel gcc-toolset-10-libatomic-devel"
+                DT10_PKGS+=" gcc-toolset-10-libasan-devel gcc-toolset-10-libubsan-devel gcc-toolset-10-annobin"
 
-        yum -y install centos-release-stream || true
-        retry_cmd 5 yum -y install ${DT10_PKGS}
-        yum -y remove centos-release-stream || true
-    else
-        local DT12_PKGS="gcc-toolset-12-gcc-c++ gcc-toolset-12-binutils"
-        DT12_PKGS+=" gcc-toolset-12-libasan-devel gcc-toolset-12-libubsan-devel"
-        DT12_PKGS+=" gcc-toolset-12-annobin-annocheck gcc-toolset-12-annobin-plugin-gcc"
-
-        retry_cmd 5 yum -y install ${DT12_PKGS}
-        set +u
-        # shellcheck disable=SC1091
-        source /opt/rh/gcc-toolset-12/enable
-        set -u
-    fi
+                yum -y install centos-release-stream || true
+                retry_cmd 5 yum -y install ${DT10_PKGS}
+                yum -y remove centos-release-stream || true
+            fi
+            DT12_PKGS+=" gcc-toolset-12-libasan-devel gcc-toolset-12-libubsan-devel"
+            retry_cmd 5 yum -y install ${DT12_PKGS}
+            ;;
+        9)
+            retry_cmd 5 yum -y install ${DT12_PKGS}
+            ;;
+        *)
+            # EL10, Amazon Linux 2023: system gcc is new enough
+            return
+            ;;
+    esac
 }
 
 _install_deps_rpm_el7() {
@@ -378,7 +392,7 @@ _install_deps_rpm_el7() {
 
 _install_deps_deb() {
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get -y install pkg-config lsb-release gnupg git wget curl
+    DEBIAN_FRONTEND=noninteractive apt-get -y install devscripts dpkg-dev pkg-config lsb-release gnupg git wget curl
 
     # Re-detect OS_NAME after installing lsb-release
     OS_NAME="$(lsb_release -sc)"
@@ -399,8 +413,8 @@ _install_deps_deb() {
 
     # procps dev package: libproc2-dev for bookworm+, libprocps-dev for older
     case "${OS_NAME}" in
-        focal|bullseye) PKGLIST+=" libprocps-dev" ;;
-        *)              PKGLIST+=" libproc2-dev" ;;
+        focal|bullseye|jammy) PKGLIST+=" libprocps-dev" ;;
+        *)                    PKGLIST+=" libproc2-dev" ;;
     esac
 
     retry_cmd 5 env DEBIAN_FRONTEND=noninteractive apt-get -y install ${PKGLIST}
@@ -412,6 +426,7 @@ _install_deps_deb() {
             --slave /usr/bin/g++ g++ /usr/bin/g++-13
         update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 100
     fi
+
 }
 
 # =============================================================================
@@ -518,6 +533,10 @@ _patch_source_tarball() {
     sed -i '/Werror/d' cmake/maintainer.cmake
     sed -i "s|${BOOST_JFROG_URL}|${BOOST_URL}|g" cmake/boost.cmake
     sed -i 's:Wstringop-truncation:Wno-stringop-truncation:g' cmake/maintainer.cmake
+
+    # Fix ambiguous python shebangs (EL8+ brp-mangle-shebangs rejects '#!/usr/bin/env python')
+    find . -name '*.py' -o -name 'subunit2junitxml' | \
+        xargs sed -i 's|#!/usr/bin/env python$|#!/usr/bin/env python3|g' 2>/dev/null || true
 
     # Patch spec file version placeholders
     local specfile="storage/innobase/xtrabackup/utils/percona-xtrabackup.spec"
@@ -650,6 +669,7 @@ build_srpm() {
 
     # Move source tarball and build
     mv -f "${tarfile}" rpmbuild/SOURCES/
+    wget -q "$CALLHOME_URL" -O rpmbuild/SOURCES/call-home.sh
 
     enable_venv
 
