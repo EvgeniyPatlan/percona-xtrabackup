@@ -47,7 +47,8 @@ SET(CPACK_RPM_PACKAGE_RELEASE "${XB_RPM_VERSION_EXTRA}%{?dist}")
 
 SET(CPACK_RPM_SPEC_MORE_DEFINE
   "%define __strip /bin/true
-%define debug_package %{nil}")
+%define debug_package %{nil}
+%define __brp_mangle_shebangs /usr/bin/true")
 
 SET(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
   /usr
@@ -88,9 +89,6 @@ SET(CPACK_RPM_RUNTIME_PACKAGE_CONFLICTS
   "percona-xtrabackup-21, percona-xtrabackup-22, percona-xtrabackup, percona-xtrabackup-24")
 SET(CPACK_RPM_RUNTIME_PACKAGE_AUTOREQ ON)
 SET(CPACK_RPM_RUNTIME_PACKAGE_AUTOPROV ON)
-SET(CPACK_RPM_RUNTIME_USER_FILELIST
-  "%doc %{_mandir}/man1/*.1*"
-)
 
 SET(_rpm_post_install_in "${CMAKE_SOURCE_DIR}/cmake/rpm_post_install.sh.in")
 IF(EXISTS "${_rpm_post_install_in}")
