@@ -1,8 +1,4 @@
 # cmake/cpack_rpm.cmake
-# =============================================================================
-# CPack RPM Configuration for Percona XtraBackup 8.0
-# Replaces: storage/innobase/xtrabackup/utils/percona-xtrabackup.spec
-# =============================================================================
 
 IF(NOT DEFINED XB_VERSION_MAJOR)
   SET(XB_VERSION_MAJOR ${MAJOR_VERSION})
