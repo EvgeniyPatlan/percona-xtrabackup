@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #
-# Percona XtraBackup 8.0 - Build Script
+# Percona XtraBackup 8.0 - Build Script (CPack Edition)
 # Builds source tarballs, SRPMs, RPMs, source DEBs, DEBs, and binary tarballs.
+#
+# RPMs are now built via: cmake + make + cpack -G RPM
+# DEBs are now built via: cmake + make + cpack -G DEB
+#   (DEB limitation: no -dbg package; use --build_deb_legacy=1 for that)
 #
 # Supported distributions:
 #   RPM-based:  OracleLinux / RHEL 8, 9, 10; Amazon Linux 2023
@@ -26,6 +30,24 @@ readonly CALLHOME_URL="https://raw.githubusercontent.com/Percona-Lab/telemetry-a
 readonly SUPPORTED_RPM_VERSIONS="7 8 9 10 2023"
 readonly SUPPORTED_DEB_CODENAMES="focal bullseye bookworm trixie jammy noble resolute"
 
+# Common cmake flags shared between release and debug builds
+# Used by build_rpm and build_deb (CPack path)
+CMAKE_COMMON_FLAGS=(
+    -DBUILD_CONFIG=xtrabackup_release
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DWITH_SSL=system
+    -DINSTALL_MANDIR=/usr/share/man
+    -DWITH_MAN_PAGES=1
+    -DMINIMAL_RELWITHDEBINFO=OFF
+    -DDOWNLOAD_BOOST=1
+    -DWITH_BOOST=libboost
+    -DINSTALL_PLUGINDIR=lib/xtrabackup/plugin
+    -DFORCE_INSOURCE_BUILD=1
+    -DWITH_ZLIB=bundled
+    -DWITH_ZSTD=bundled
+    -DWITH_PROTOBUF=bundled
+)
+
 # =============================================================================
 # Logging Helpers
 # =============================================================================
@@ -45,7 +67,6 @@ safe_cd() {
     cd "$1" || log_fatal "Failed to change directory to: $1"
 }
 
-# Retry a command with a simple backoff
 retry_cmd() {
     local max_attempts="${1:-5}"
     shift
@@ -61,9 +82,6 @@ retry_cmd() {
     done
 }
 
-# Find a file matching a glob pattern, checking WORKDIR/subdir first, then CURDIR/subdir.
-# Usage: find_artifact <subdir> <glob_pattern>
-# Sets: FOUND_FILE (basename), FOUND_PATH (full path)
 find_artifact() {
     local subdir="$1"
     local pattern="$2"
@@ -71,38 +89,32 @@ find_artifact() {
     FOUND_FILE=""
     FOUND_PATH=""
 
-    # Search order: WORKDIR/subdir, CURDIR/subdir, WORKDIR root, CURDIR root
-    local search_dirs=(
-        "${WORKDIR}/${subdir}"
-        "${CURDIR}/${subdir}"
-        "${WORKDIR}"
-        "${CURDIR}"
-    )
-
     local candidate
-    for dir in "${search_dirs[@]}"; do
-        candidate="$(find "$dir" -maxdepth 1 -name "${pattern}" 2>/dev/null | sort | tail -n1)"
-        if [[ -n "$candidate" ]]; then
-            FOUND_FILE="$(basename "$candidate")"
-            FOUND_PATH="$candidate"
-            return 0
-        fi
-    done
+    candidate="$(find "${WORKDIR}/${subdir}" -name "${pattern}" 2>/dev/null | sort | tail -n1)"
+    if [[ -n "$candidate" ]]; then
+        FOUND_FILE="$(basename "$candidate")"
+        FOUND_PATH="$candidate"
+        return 0
+    fi
+
+    candidate="$(find "${CURDIR}/${subdir}" -name "${pattern}" 2>/dev/null | sort | tail -n1)"
+    if [[ -n "$candidate" ]]; then
+        FOUND_FILE="$(basename "$candidate")"
+        FOUND_PATH="$candidate"
+        return 0
+    fi
 
     return 1
 }
 
-# Copy artifacts to both WORKDIR/<dir> and CURDIR/<dir>
 publish_artifacts() {
     local subdir="$1"
     shift
-    # remaining args are file globs/paths to copy
 
     mkdir -p "${WORKDIR}/${subdir}"
     mkdir -p "${CURDIR}/${subdir}"
 
     for src in "$@"; do
-        # Handle globs: iterate over expanded paths
         for f in $src; do
             [[ -f "$f" ]] || continue
             cp "$f" "${WORKDIR}/${subdir}/"
@@ -123,8 +135,9 @@ Options:
     --get_sources=0|1       Download sources from GitHub (default: 0)
     --build_src_rpm=0|1     Build source RPM (default: 0)
     --build_source_deb=0|1  Build source DEB package (default: 0)
-    --build_rpm=0|1         Build RPM packages (default: 0)
-    --build_deb=0|1         Build DEB packages (default: 0)
+    --build_rpm=0|1         Build RPM packages via CPack (default: 0)
+    --build_deb=0|1         Build DEB packages via CPack (default: 0)
+    --build_deb_legacy=0|1  Build DEB packages via dpkg-buildpackage (includes -dbg) (default: 0)
     --build_tarball=0|1     Build binary tarball (default: 0)
     --install_deps=0|1      Install build dependencies (requires root) (default: 0)
     --branch=BRANCH         Git branch to build (default: 8.0)
@@ -134,7 +147,7 @@ Options:
     --help                  Show this help message
 
 Example:
-    ${SCRIPT_NAME} --builddir=/tmp/PXB --get_sources=1 --build_src_rpm=1 --build_rpm=1
+    ${SCRIPT_NAME} --builddir=/tmp/PXB --get_sources=1 --build_rpm=1
 
 Supported platforms:
     RPM:  OracleLinux / RHEL 8, 9, 10; Amazon Linux 2023
@@ -163,6 +176,7 @@ parse_arguments() {
             --build_source_deb=*) SDEB="$val" ;;
             --build_rpm=*)        RPM="$val" ;;
             --build_deb=*)        DEB="$val" ;;
+            --build_deb_legacy=*) DEB_LEGACY="$val" ;;
             --get_sources=*)      SOURCE="$val" ;;
             --build_tarball=*)    BUILD_TARBALL="$val" ;;
             --install_deps=*)     INSTALL="$val" ;;
@@ -236,15 +250,12 @@ switch_to_vault_repo() {
     sed -i 's|#\s*baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-* 2>/dev/null || true
 }
 
-# Activate SCL devtoolset and python36 on CentOS 7 (needed for cmake3 and rpmbuild)
 enable_venv() {
     [[ "$OS" != "rpm" || "${RHEL}" != "7" ]] && return
-    set +u
     # shellcheck disable=SC1091
     source /opt/rh/devtoolset-7/enable
     # shellcheck disable=SC1091
     source /opt/rh/rh-python36/enable
-    set -u
     CMAKE_BIN="cmake3"
 }
 
@@ -273,13 +284,7 @@ _install_deps_rpm() {
         return
     fi
 
-    # Amazon Linux 2023 Docker images ship curl-minimal which conflicts with curl.
-    # Replace it with the full curl package before installing other deps.
-    if [[ "${RHEL}" == "2023" ]]; then
-        yum -y install --allowerasing git wget yum-utils curl
-    else
-        yum -y install git wget yum-utils curl
-    fi
+    yum -y install git wget yum-utils curl
     yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm || true
 
     _configure_rpm_repos
@@ -310,12 +315,10 @@ _install_deps_rpm() {
 }
 
 _configure_rpm_repos() {
-    # Amazon Linux 2023: no OL repos or EPEL needed, packages available natively
     if [[ "${RHEL}" == "2023" ]]; then
         return
     fi
 
-    # Enable CodeReady Builder / CRB equivalent for OL/RHEL
     yum-config-manager --enable "ol${RHEL}_codeready_builder" || true
 
     if [[ "${ARCH}" == "x86_64" ]]; then
@@ -326,42 +329,33 @@ _configure_rpm_repos() {
         esac
     fi
 
-    # EPEL
     yum -y install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${RHEL}.noarch.rpm" || true
     yum -y install epel-release || true
 }
 
 _install_rpm_devtoolset() {
-    local DT12_PKGS="gcc-toolset-12-gcc gcc-toolset-12-gcc-c++ gcc-toolset-12-binutils"
-    DT12_PKGS+=" gcc-toolset-12-annobin-annocheck gcc-toolset-12-annobin-plugin-gcc"
+    [[ "${RHEL}" != "8" ]] && return
 
-    case "${RHEL}" in
-        8)
-            if [[ "${ARCH}" == "x86_64" ]]; then
-                # EL8 x86_64: also install devtoolset-10 (used for valgrind/asan)
-                local DT10_PKGS="gcc-toolset-10-gcc-c++ gcc-toolset-10-binutils"
-                DT10_PKGS+=" gcc-toolset-10-valgrind gcc-toolset-10-valgrind-devel gcc-toolset-10-libatomic-devel"
-                DT10_PKGS+=" gcc-toolset-10-libasan-devel gcc-toolset-10-libubsan-devel gcc-toolset-10-annobin"
+    if [[ "${ARCH}" == "x86_64" ]]; then
+        local DT10_PKGS="gcc-toolset-10-gcc-c++ gcc-toolset-10-binutils"
+        DT10_PKGS+=" gcc-toolset-10-valgrind gcc-toolset-10-valgrind-devel gcc-toolset-10-libatomic-devel"
+        DT10_PKGS+=" gcc-toolset-10-libasan-devel gcc-toolset-10-libubsan-devel gcc-toolset-10-annobin"
 
-                yum -y install centos-release-stream || true
-                retry_cmd 5 yum -y install ${DT10_PKGS}
-                yum -y remove centos-release-stream || true
-            fi
-            DT12_PKGS+=" gcc-toolset-12-libasan-devel gcc-toolset-12-libubsan-devel"
-            retry_cmd 5 yum -y install ${DT12_PKGS}
-            ;;
-        9)
-            retry_cmd 5 yum -y install ${DT12_PKGS}
-            ;;
-        *)
-            # EL10, Amazon Linux 2023: system gcc is new enough
-            return
-            ;;
-    esac
+        yum -y install centos-release-stream || true
+        retry_cmd 5 yum -y install ${DT10_PKGS}
+        yum -y remove centos-release-stream || true
+    else
+        local DT12_PKGS="gcc-toolset-12-gcc-c++ gcc-toolset-12-binutils"
+        DT12_PKGS+=" gcc-toolset-12-libasan-devel gcc-toolset-12-libubsan-devel"
+        DT12_PKGS+=" gcc-toolset-12-annobin-annocheck gcc-toolset-12-annobin-plugin-gcc"
+
+        retry_cmd 5 yum -y install ${DT12_PKGS}
+        # shellcheck disable=SC1091
+        source /opt/rh/gcc-toolset-12/enable
+    fi
 }
 
 _install_deps_rpm_el7() {
-    # CentOS 7: minimal deps for get_sources + build_src_rpm only
     switch_to_vault_repo
 
     retry_cmd 5 yum -y install epel-release centos-release-scl
@@ -392,16 +386,11 @@ _install_deps_rpm_el7() {
 
 _install_deps_deb() {
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get -y install devscripts dpkg-dev pkg-config lsb-release gnupg git wget curl
+    DEBIAN_FRONTEND=noninteractive apt-get -y install pkg-config lsb-release gnupg git wget curl
 
-    # Re-detect OS_NAME after installing lsb-release
     OS_NAME="$(lsb_release -sc)"
     export OS_NAME
 
-#    wget "https://repo.percona.com/apt/percona-release_latest.${OS_NAME}_all.deb" \
-#        && dpkg -i "percona-release_latest.${OS_NAME}_all.deb"
-    #percona-release enable tools testing
-#    percona-release disable all
     apt-get update
 
     local PKGLIST=""
@@ -411,22 +400,19 @@ _install_deps_deb() {
     PKGLIST+=" build-essential rsync libdbd-mysql-perl libnuma1 socat libssl-dev patchelf libicu-dev"
     PKGLIST+=" python3-sphinx python3-docutils"
 
-    # procps dev package: libproc2-dev for bookworm+, libprocps-dev for older
     case "${OS_NAME}" in
-        focal|bullseye|jammy) PKGLIST+=" libprocps-dev" ;;
-        *)                    PKGLIST+=" libproc2-dev" ;;
+        focal|bullseye) PKGLIST+=" libprocps-dev" ;;
+        *)              PKGLIST+=" libproc2-dev" ;;
     esac
 
     retry_cmd 5 env DEBIAN_FRONTEND=noninteractive apt-get -y install ${PKGLIST}
 
-    # Trixie: pin GCC 13
     if [[ "${OS_NAME}" == "trixie" ]]; then
         apt-get -y install gcc-13 g++-13
         update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
             --slave /usr/bin/g++ g++ /usr/bin/g++-13
         update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 100
     fi
-
 }
 
 # =============================================================================
@@ -500,7 +486,6 @@ _write_properties() {
 }
 
 _generate_source_tarball() {
-    # Replace Boost URL
     sed -i "s|${BOOST_JFROG_URL}|${BOOST_URL}|g" cmake/boost.cmake
 
     enable_venv
@@ -534,29 +519,27 @@ _patch_source_tarball() {
     sed -i "s|${BOOST_JFROG_URL}|${BOOST_URL}|g" cmake/boost.cmake
     sed -i 's:Wstringop-truncation:Wno-stringop-truncation:g' cmake/maintainer.cmake
 
-    # Fix ambiguous python shebangs (EL8+ brp-mangle-shebangs rejects '#!/usr/bin/env python')
-    find . -name '*.py' -o -name 'subunit2junitxml' | \
-        xargs sed -i 's|#!/usr/bin/env python$|#!/usr/bin/env python3|g' 2>/dev/null || true
-
-    # Patch spec file version placeholders
+    # Patch spec file version placeholders (kept for build_srpm legacy path)
     local specfile="storage/innobase/xtrabackup/utils/percona-xtrabackup.spec"
-    sed -i "s:@@XB_VERSION_MAJOR@@:${XB_VERSION_MAJOR}:g" "$specfile"
-    sed -i "s:@@XB_VERSION_MINOR@@:${XB_VERSION_MINOR}:g" "$specfile"
-    sed -i "s:@@XB_VERSION_PATCH@@:${XB_VERSION_PATCH}:g" "$specfile"
+    if [[ -f "$specfile" ]]; then
+        sed -i "s:@@XB_VERSION_MAJOR@@:${XB_VERSION_MAJOR}:g" "$specfile"
+        sed -i "s:@@XB_VERSION_MINOR@@:${XB_VERSION_MINOR}:g" "$specfile"
+        sed -i "s:@@XB_VERSION_PATCH@@:${XB_VERSION_PATCH}:g" "$specfile"
 
-    local extraver rpm_extraver
-    if [[ -z "${XB_VERSION_EXTRA}" ]]; then
-        extraver="%{nil}"
-        rpm_extraver="${RPM_RELEASE}"
-    else
-        extraver="${XB_VERSION_EXTRA}"
-        rpm_extraver="${XB_VERSION_EXTRA#-}.${RPM_RELEASE}"
+        local extraver rpm_extraver
+        if [[ -z "${XB_VERSION_EXTRA}" ]]; then
+            extraver="%{nil}"
+            rpm_extraver="${RPM_RELEASE}"
+        else
+            extraver="${XB_VERSION_EXTRA}"
+            rpm_extraver="${XB_VERSION_EXTRA#-}.${RPM_RELEASE}"
+        fi
+
+        sed -i "s:@@XB_VERSION_EXTRA@@:${extraver}:g"         "$specfile"
+        sed -i "s:@@XB_RPM_VERSION_EXTRA@@:${rpm_extraver}:g" "$specfile"
+        sed -i "s:@@XB_REVISION@@:${REVISION}:g"              "$specfile"
+        sed -i "s:@@RPM_RELEASE@@:${RPM_RELEASE}:g"           "$specfile"
     fi
-
-    sed -i "s:@@XB_VERSION_EXTRA@@:${extraver}:g"         "$specfile"
-    sed -i "s:@@XB_RPM_VERSION_EXTRA@@:${rpm_extraver}:g" "$specfile"
-    sed -i "s:@@XB_REVISION@@:${REVISION}:g"              "$specfile"
-    sed -i "s:@@RPM_RELEASE@@:${RPM_RELEASE}:g"           "$specfile"
 }
 
 _package_and_publish_sources() {
@@ -599,7 +582,7 @@ get_deb_sources() {
 }
 
 # =============================================================================
-# Call-Home Script Injection (RPM spec)
+# Call-Home Script Injection (RPM spec — legacy SRPM path only)
 # =============================================================================
 _inject_callhome_rpm() {
     local specfile="$1"
@@ -627,7 +610,7 @@ _inject_callhome_rpm() {
 }
 
 # =============================================================================
-# Build: Source RPM
+# Build: Source RPM (legacy path — CentOS 7 only)
 # =============================================================================
 build_srpm() {
     if [[ "$SRPM" == "0" ]]; then
@@ -650,26 +633,21 @@ build_srpm() {
     tmprel="$(echo "${tarfile}" | awk -F '-' '{print $4}')"
     local release="${tmprel%.tar.gz}"
 
-    # Extract spec file from tarball (avoid --wildcards --strip, unreliable on older tar)
     local tardir="${tarfile%.tar.gz}"
     local spec_path="${tardir}/storage/innobase/xtrabackup/utils/percona-xtrabackup.spec"
     tar xzf "${WORKDIR}/${tarfile}" "${spec_path}"
     cp "${spec_path}" rpmbuild/SPECS/
     rm -rf "${tardir}"
 
-    # Add changelog entry
     local specfile="rpmbuild/SPECS/percona-xtrabackup.spec"
     [[ -f "$specfile" ]] || log_fatal "Spec file not found after extraction from tarball"
     sed -i "/^%changelog/a - Release ${version}-${release}" "$specfile"
     sed -i "/^%changelog/a * $(date '+%a %b %d %Y') Percona Development Team <info@percona.com> - ${version}-${release}" "$specfile"
 
-    # Inject call-home script
     _inject_callhome_rpm "${WORKDIR}/${specfile}"
     safe_cd "$WORKDIR"
 
-    # Move source tarball and build
     mv -f "${tarfile}" rpmbuild/SOURCES/
-    wget -q "$CALLHOME_URL" -O rpmbuild/SOURCES/call-home.sh
 
     enable_venv
 
@@ -682,7 +660,7 @@ build_srpm() {
 }
 
 # =============================================================================
-# Build: RPM
+# Build: RPM (via CPack)
 # =============================================================================
 build_rpm() {
     if [[ "$RPM" == "0" ]]; then
@@ -691,15 +669,16 @@ build_rpm() {
     fi
     [[ "$OS" == "deb" ]] && log_fatal "Cannot build RPM on a Debian-based system"
     [[ "$OS" == "rpm" && "${RHEL}" == "7" ]] && log_fatal "Binary RPM builds are not supported on CentOS 7. Use --build_src_rpm=1 only."
-    if ! find_artifact "srpm" 'percona-xtrabackup-*.src.rpm'; then
-        log_fatal "No source RPM found. Use --build_src_rpm=1 first."
-    fi
-    cp "$FOUND_PATH" "${WORKDIR}/"
 
+    get_tar "source_tarball"
     safe_cd "$WORKDIR"
-    rm -fr rpmbuild
-    mkdir -vp rpmbuild/{SOURCES,SPECS,BUILD,SRPMS,RPMS}
-    cp "${FOUND_FILE}" rpmbuild/SRPMS/
+
+    local tarfile
+    tarfile="$(basename "$(find . -maxdepth 1 -name 'percona-xtrabackup-*.tar.gz' | sort | tail -n1)")"
+
+    rm -fr "${tarfile%.tar.gz}"
+    tar xzf "${tarfile}"
+    safe_cd "${tarfile%.tar.gz}"
 
     # Write build metadata
     {
@@ -707,17 +686,36 @@ build_rpm() {
         echo "ARCH=${ARCH}"
     } >> "${CURDIR}/${PROPERTIES_FILE}"
 
+    # --- Debug build ---
+    log_info "Building debug binary"
+    mkdir -p debug
+    cd debug
+    cmake .. "${CMAKE_COMMON_FLAGS[@]}" \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DMYSQL_UNIX_ADDR="/var/lib/mysql/mysql.sock"
+    make -j"$(nproc)" xtrabackup
+    local debug_bin
+    debug_bin="$(pwd)/runtime_output_directory/xtrabackup"
+    cd ..
 
-    rpmbuild \
-        --define "_topdir ${WORKDIR}/rpmbuild" \
-        --define "dist .${OS_NAME}" \
-        --rebuild "rpmbuild/SRPMS/${FOUND_FILE}"
+    # --- Release build ---
+    log_info "Building release"
+    cmake . "${CMAKE_COMMON_FLAGS[@]}" \
+        -DINSTALL_MYSQLTESTDIR=/usr/share/percona-xtrabackup-test-80 \
+        -DMYSQL_UNIX_ADDR="/var/lib/mysql/mysql.sock" \
+        -DRPM_RELEASE="${RPM_RELEASE}" \
+        -DPXB_DEBUG_BINARY="${debug_bin}"
+    make -j"$(nproc)"
 
-    publish_artifacts "rpm" "${WORKDIR}/rpmbuild/RPMS/"*/*.rpm
+    # --- Package with CPack ---
+    log_info "Packaging RPMs via CPack"
+    cpack -G RPM
+
+    publish_artifacts "rpm" "${WORKDIR}/${tarfile%.tar.gz}/"*.rpm
 }
 
 # =============================================================================
-# Build: Source DEB
+# Build: Source DEB (unchanged — dpkg-buildpackage -S)
 # =============================================================================
 build_source_deb() {
     if [[ "$SDEB" == "0" ]]; then
@@ -762,11 +760,70 @@ build_source_deb() {
 }
 
 # =============================================================================
-# Build: DEB
+# Build: DEB (via CPack — no -dbg package)
 # =============================================================================
 build_deb() {
     if [[ "$DEB" == "0" ]]; then
         log_info "Skipping DEB build"
+        return
+    fi
+    [[ "$OS" == "rpm" ]] && log_fatal "Cannot build DEB on an RPM-based system"
+
+    get_tar "source_tarball"
+    safe_cd "$WORKDIR"
+
+    local tarfile
+    tarfile="$(basename "$(find . -maxdepth 1 -name 'percona-xtrabackup-*.tar.gz' | sort | tail -n1)")"
+
+    rm -fr "${tarfile%.tar.gz}"
+    tar xzf "${tarfile}"
+    safe_cd "${tarfile%.tar.gz}"
+
+    local DEB_HOST_MULTIARCH
+    DEB_HOST_MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+
+    {
+        echo "DEB_RELEASE=${DEB_RELEASE}"
+        echo "DEBIAN_VERSION=${OS_NAME}"
+        echo "ARCH=${ARCH}"
+    } >> "${CURDIR}/${PROPERTIES_FILE}"
+
+    # --- Debug build ---
+    log_info "Building debug binary"
+    mkdir -p debug
+    cd debug
+    cmake .. "${CMAKE_COMMON_FLAGS[@]}" \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DMYSQL_UNIX_ADDR=/var/run/mysqld/mysqld.sock \
+        -DOPENSSL_ROOT_DIR="/usr/lib/${DEB_HOST_MULTIARCH}"
+    make -j"$(nproc)" xtrabackup
+    local debug_bin
+    debug_bin="$(pwd)/runtime_output_directory/xtrabackup"
+    cd ..
+
+    # --- Release build ---
+    log_info "Building release"
+    cmake . "${CMAKE_COMMON_FLAGS[@]}" \
+        -DINSTALL_MYSQLTESTDIR=/usr/share/percona-xtrabackup-test-80 \
+        -DMYSQL_UNIX_ADDR=/var/run/mysqld/mysqld.sock \
+        -DOPENSSL_ROOT_DIR="/usr/lib/${DEB_HOST_MULTIARCH}" \
+        -DDEB_RELEASE="${DEB_RELEASE}" \
+        -DPXB_DEBUG_BINARY="${debug_bin}"
+    make -j"$(nproc)"
+
+    # --- Package with CPack ---
+    log_info "Packaging DEBs via CPack"
+    cpack -G DEB
+
+    publish_artifacts "deb" "${WORKDIR}/${tarfile%.tar.gz}/"*.deb
+}
+
+# =============================================================================
+# Build: DEB Legacy (via dpkg-buildpackage — includes -dbg package)
+# =============================================================================
+build_deb_legacy() {
+    if [[ "$DEB_LEGACY" == "0" ]]; then
+        log_info "Skipping legacy DEB build"
         return
     fi
     [[ "$OS" == "rpm" ]] && log_fatal "Cannot build DEB on an RPM-based system"
@@ -836,7 +893,6 @@ build_tarball() {
     local tarfile
     tarfile="$(basename "$(find . -maxdepth 1 -name 'percona-xtrabackup-*.tar.gz' | sort | tail -n1)")"
 
-
     rm -fr TARGET "${tarfile%.tar.gz}"
     mkdir TARGET
     tar xzf "${tarfile}"
@@ -858,6 +914,7 @@ main() {
     SDEB=0
     RPM=0
     DEB=0
+    DEB_LEGACY=0
     SOURCE=0
     BUILD_TARBALL=0
     OS_NAME=""
@@ -883,6 +940,7 @@ main() {
     build_source_deb
     build_rpm
     build_deb
+    build_deb_legacy
 
     log_info "Build completed successfully"
 }
